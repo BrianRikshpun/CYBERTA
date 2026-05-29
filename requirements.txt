@@ -1,0 +1,24 @@
+# ── Gradio UI ──────────────────────────────────────────────────────────────────
+gradio>=4.36.0
+
+# ── Document parsers ───────────────────────────────────────────────────────────
+PyMuPDF>=1.24.0
+python-docx>=1.1.0
+python-pptx>=0.6.23
+
+# ── Open-source embeddings (all local, no API key) ─────────────────────────────
+sentence-transformers>=3.0.0
+
+# ── Vector store ───────────────────────────────────────────────────────────────
+chromadb>=0.5.0
+
+# ── LLM providers ──────────────────────────────────────────────────────────────
+anthropic>=0.28.0          # Claude (optional)
+openai>=1.30.0             # OpenAI GPT (optional)
+requests>=2.31.0           # HuggingFace Inference API + Ollama
+
+# ── Visualisation ──────────────────────────────────────────────────────────────
+plotly>=5.22.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+umap-learn>=0.5.6          # optional – falls back to PCA if not installed
