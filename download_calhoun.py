@@ -1,12 +1,11 @@
 """
 CyberTA – Calhoun NPS Thesis Downloader
-Downloads Information Sciences (IS) department theses only.
-Uses DSpace 7 REST API with department facet filter.
+Downloads Information Sciences (IS) department theses.
+Paginates until no more results.
 
 Usage:
-    python download_calhoun.py --n 20
-    python download_calhoun.py --n 50 --search "cyber network"
-    python download_calhoun.py --n 30 --dept "Defense Analysis"
+    python download_calhoun.py --n 200
+    python download_calhoun.py --n 500 --search "cyber network"
 """
 
 import os, re, sys, csv, time, argparse, requests
@@ -14,10 +13,10 @@ from pathlib import Path
 
 BASE     = "https://calhoun.nps.edu"
 REST_API = f"{BASE}/server/api"
-SLEEP    = 1.0
+SLEEP    = 0.8
 
 HEADERS = {
-    "User-Agent": "CyberTA-Research/1.0 (NPS educational use)",
+    "User-Agent": "Mozilla/5.0 (compatible; CyberTA/1.0; educational use)",
     "Accept"    : "application/json",
 }
 
@@ -65,26 +64,26 @@ def get_full_item(uuid):
         return {}
 
 
-def get_items(n, dept="Information Sciences", search=""):
+def get_all_items(n, dept="Information Sciences", search=""):
     """
-    Fetch items using DSpace discover search with department facet filter.
-    This guarantees only the specified department is returned.
+    Paginate through ALL pages until empty or n reached.
     """
-    items  = []
-    page   = 0
-    size   = min(n, 20)
-    query  = search if search else "Information Sciences"
+    items = []
+    seen  = set()
+    page  = 0
+    size  = 20
+    query = search if search else "*"
 
-    print(f"🔍 Fetching '{dept}' theses from Calhoun…")
+    print(f"🔍 Fetching '{dept}' theses — paginating until {n} found or exhausted…")
 
     while len(items) < n:
         params = {
-            "query"       : query,
-            "dsoType"     : "item",
-            "f.department": f"{dept},equals",
-            "page"        : page,
-            "size"        : size,
-            "sort"        : "dc.date.issued,DESC",
+            "query"        : query,
+            "dsoType"      : "item",
+            "f.department" : f"{dept},equals",
+            "page"         : page,
+            "size"         : size,
+            "sort"         : "dc.date.issued,DESC",
         }
         try:
             r = requests.get(f"{REST_API}/discover/search/objects",
@@ -103,24 +102,29 @@ def get_items(n, dept="Information Sciences", search=""):
                  for o in objects]
 
         if not batch:
+            print(f"  No more results at page {page}.")
             break
 
+        added = 0
         for item in batch:
+            uuid = item.get("uuid") or item.get("id")
+            if uuid and uuid not in seen:
+                seen.add(uuid)
+                items.append({"uuid": uuid, "name": item.get("name","untitled")})
+                added += 1
             if len(items) >= n:
                 break
-            uuid = item.get("uuid") or item.get("id")
-            if uuid:
-                items.append({"uuid": uuid,
-                              "name": item.get("name","untitled")})
 
-        total_pages = data.get("page",{}).get("totalPages", 1)
-        print(f"  Page {page+1}/{total_pages} — {len(items)} items so far…")
-        if page >= total_pages - 1:
+        print(f"  Page {page+1}: +{added} items (total: {len(items)})")
+
+        if len(batch) < size:
+            print(f"  Last page reached.")
             break
+
         page += 1
         time.sleep(SLEEP)
 
-    print(f"  ✅ Total: {len(items)} items found.\n")
+    print(f"  ✅ {len(items)} unique items found.\n")
     return items
 
 
@@ -165,14 +169,10 @@ def download_pdf(url, dest):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n",      type=int, default=20,
-                        help="Number of theses to download (default: 20)")
-    parser.add_argument("--out",    default="./data",
-                        help="Output directory (default: ./data)")
-    parser.add_argument("--search", default="",
-                        help="Keyword filter (e.g. 'cyber AI network')")
-    parser.add_argument("--dept",   default="Information Sciences",
-                        help="Department name filter (default: 'Information Sciences')")
+    parser.add_argument("--n",      type=int, default=50)
+    parser.add_argument("--out",    default="./data")
+    parser.add_argument("--search", default="")
+    parser.add_argument("--dept",   default="Information Sciences")
     args = parser.parse_args()
 
     out_dir  = Path(args.out)
@@ -187,7 +187,7 @@ def main():
     if args.search: print(f"  Search     : '{args.search}'")
     print(f"{'='*60}\n")
 
-    stubs      = get_items(args.n, dept=args.dept, search=args.search)
+    stubs      = get_all_items(args.n, dept=args.dept, search=args.search)
     downloaded = skipped = failed = 0
     all_meta   = []
 
@@ -204,8 +204,7 @@ def main():
 
         print(f"  📄 {title[:70]}")
         for lbl, key in [("Author","author"),("Advisor","advisor"),
-                         ("2nd Reader","second_reader"),("Date","date"),
-                         ("Dept","department")]:
+                         ("2nd Reader","second_reader"),("Date","date")]:
             v = meta.get(key,"")
             if v: print(f"    {lbl:<12}: {v[:80]}")
 
@@ -223,7 +222,7 @@ def main():
         time.sleep(SLEEP)
 
         if not pdf_url:
-            print(f"    ⚠️  No PDF found.\n")
+            print(f"    ⚠️  No PDF.\n")
             meta.update({"pdf_file": "", "status": "no_pdf"})
             all_meta.append(meta)
             failed += 1
@@ -245,14 +244,16 @@ def main():
         else:
             failed += 1
 
-    # Save CSV
+    # Save/append CSV
     if all_meta:
         fields = ["title","author","advisor","second_reader","date",
                   "department","degree","keywords","abstract",
                   "pdf_file","status","uuid"]
-        with open(csv_path,"w",newline="",encoding="utf-8") as f:
+        write_header = not csv_path.exists()
+        with open(csv_path,"a",newline="",encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-            w.writeheader()
+            if write_header:
+                w.writeheader()
             w.writerows(all_meta)
         print(f"📋 Metadata saved → {csv_path}")
 
@@ -261,7 +262,7 @@ def main():
     print(f"  Skipped    : {skipped}")
     print(f"  Failed     : {failed}")
     print(f"{'='*60}")
-    print(f"\nNext: python build_vdb.py --reset")
+    print(f"\nNext: transfer data/ to Hamming, then python build_vdb.py --reset")
 
 if __name__ == "__main__":
     main()
