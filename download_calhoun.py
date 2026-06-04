@@ -1,108 +1,84 @@
 """
 CyberTA – Calhoun NPS Thesis Downloader
-Uses the DSpace 7 REST API to fetch IS department theses,
-download PDFs, and extract metadata (advisor, second reader, title, date, author).
+Downloads IS department theses only, with full metadata.
 
 Usage:
     python download_calhoun.py --n 20
-    python download_calhoun.py --n 50 --out ./data --search "cyber network"
-
-Outputs:
-    ./data/<title>.pdf          — thesis PDF
-    ./data/thesis_metadata.csv  — metadata for all downloaded theses
+    python download_calhoun.py --n 50 --search "cyber network"
 """
 
-import os
-import re
-import sys
-import csv
-import time
-import argparse
-import requests
+import os, re, sys, csv, time, argparse, requests
 from pathlib import Path
 
-# ── Config ────────────────────────────────────────────────────────────────────
 BASE     = "https://calhoun.nps.edu"
 REST_API = f"{BASE}/server/api"
+# Collection UUID for IS theses (from the browse URL scope param)
 IS_SCOPE = "8170278c-29e1-4af7-8cd6-c960e36516f9"
 SLEEP    = 1.0
 
 HEADERS = {
-    "User-Agent": "CyberTA-Research/1.0 (NPS thesis downloader; educational use)",
+    "User-Agent": "CyberTA-Research/1.0 (NPS educational use)",
     "Accept"    : "application/json",
 }
 
-# Dublin Core metadata field mappings
 META_FIELDS = {
     "title"        : ["dc.title"],
     "author"       : ["dc.contributor.author"],
-    "advisor"      : ["dc.contributor.advisor",
-                      "dc.contributor.firstadvisor",
-                      "thesis.degree.grantor"],
-    "second_reader": ["dc.contributor.secondreader",
-                      "dc.contributor.reader",
+    "advisor"      : ["dc.contributor.advisor","dc.contributor.firstadvisor"],
+    "second_reader": ["dc.contributor.secondreader","dc.contributor.reader",
                       "dc.contributor.committeemember"],
-    "date"         : ["dc.date.issued", "dc.date.created"],
+    "date"         : ["dc.date.issued"],
     "abstract"     : ["dc.description.abstract"],
     "department"   : ["dc.contributor.department"],
-    "degree"       : ["dc.type.degree", "thesis.degree.name"],
+    "degree"       : ["dc.type.degree","thesis.degree.name"],
     "keywords"     : ["dc.subject"],
 }
 
 
-def sanitize_filename(name: str, max_len: int = 120) -> str:
+def sanitize(name, max_len=120):
     name = re.sub(r'[\\/*?:"<>|]', "_", name)
-    name = re.sub(r'\s+', " ", name).strip()
-    return name[:max_len]
+    return re.sub(r'\s+', " ", name).strip()[:max_len]
 
 
-def extract_metadata(item: dict) -> dict:
-    """
-    Pull structured metadata from a DSpace item dict.
-    Returns a flat dict with title, author, advisor, second_reader, etc.
-    """
-    # DSpace 7 stores metadata as list of {value, language, ...} dicts
-    raw_meta = item.get("metadata", {})
-
+def extract_metadata(item):
+    raw = item.get("metadata", {})
     result = {}
-    for field_name, dc_keys in META_FIELDS.items():
-        values = []
-        for dc_key in dc_keys:
-            entries = raw_meta.get(dc_key, [])
-            for entry in entries:
-                v = entry.get("value", "").strip()
-                if v and v not in values:
-                    values.append(v)
-        result[field_name] = " | ".join(values) if values else ""
-
+    for field, keys in META_FIELDS.items():
+        vals = []
+        for k in keys:
+            for e in raw.get(k, []):
+                v = e.get("value","").strip()
+                if v and v not in vals:
+                    vals.append(v)
+        result[field] = " | ".join(vals)
     return result
 
 
-def get_full_item(item_uuid: str) -> dict:
-    """Fetch full item including metadata from DSpace REST API."""
-    url = f"{REST_API}/core/items/{item_uuid}"
+def get_full_item(uuid):
     try:
-        resp = requests.get(url, headers=HEADERS,
-                            params={"embed": "thumbnail,owningCollection"},
-                            timeout=20)
-        resp.raise_for_status()
-        return resp.json()
+        r = requests.get(f"{REST_API}/core/items/{uuid}",
+                         headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        print(f"    ⚠️  Could not fetch item metadata: {e}")
+        print(f"    ⚠️  metadata fetch failed: {e}")
         return {}
 
 
-def get_items(scope: str, n: int, search: str = "") -> list:
-    """Fetch up to N item stubs from the IS collection."""
+def get_items_from_collection(scope, n, search=""):
+    """
+    Use the collection endpoint directly — guarantees IS-only results.
+    Falls back to search with scope filter if needed.
+    """
     items = []
     page  = 0
     size  = min(n, 20)
-
-    print(f"🔍 Fetching item list from Calhoun IS dept (up to {n} theses)…")
+    print(f"🔍 Fetching IS theses from collection scope {scope}…")
 
     while len(items) < n:
         if search:
-            url = f"{REST_API}/discover/search/objects"
+            # Search within the specific collection scope
+            url    = f"{REST_API}/discover/search/objects"
             params = {
                 "scope"  : scope,
                 "query"  : search,
@@ -111,31 +87,43 @@ def get_items(scope: str, n: int, search: str = "") -> list:
                 "size"   : size,
             }
         else:
-            url = f"{REST_API}/discover/browses/dateissued/items"
-            params = {
-                "scope": scope,
-                "page" : page,
-                "size" : size,
-                "sort" : "dc.date.issued,DESC",
-            }
+            # Browse the collection directly by handle/items
+            url    = f"{REST_API}/core/collections/{scope}/mappedItems"
+            params = {"page": page, "size": size}
 
         try:
-            resp = requests.get(url, headers=HEADERS, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
+            r = requests.get(url, headers=HEADERS, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
         except Exception as e:
-            print(f"  ⚠️  API error on page {page}: {e}")
-            break
+            # Fall back to discover search with scope
+            print(f"  Collection browse failed ({e}), trying scoped search…")
+            url    = f"{REST_API}/discover/search/objects"
+            params = {
+                "scope"  : scope,
+                "query"  : search or "*",
+                "dsoType": "item",
+                "page"   : page,
+                "size"   : size,
+            }
+            try:
+                r    = requests.get(url, headers=HEADERS, params=params, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e2:
+                print(f"  ⚠️  API error: {e2}")
+                break
 
-        if search:
-            raw   = (data.get("_embedded", {})
-                         .get("searchResult", {})
-                         .get("_embedded", {})
-                         .get("objects", []))
-            batch = [obj.get("_embedded", {}).get("indexableObject", {})
-                     for obj in raw]
+        # Parse HAL response
+        if search or "searchResult" in str(data):
+            raw   = (data.get("_embedded",{})
+                        .get("searchResult",{})
+                        .get("_embedded",{})
+                        .get("objects",[]))
+            batch = [o.get("_embedded",{}).get("indexableObject",{}) for o in raw]
         else:
-            batch = data.get("_embedded", {}).get("items", [])
+            batch = data.get("_embedded",{}).get("mappedItems",
+                    data.get("_embedded",{}).get("items",[]))
 
         if not batch:
             break
@@ -145,11 +133,9 @@ def get_items(scope: str, n: int, search: str = "") -> list:
                 break
             uuid = item.get("uuid") or item.get("id")
             if uuid:
-                items.append({"uuid": uuid,
-                              "name": item.get("name", "untitled")})
+                items.append({"uuid": uuid, "name": item.get("name","untitled")})
 
-        page_info   = data.get("page", {})
-        total_pages = page_info.get("totalPages", 1)
+        total_pages = data.get("page",{}).get("totalPages", 1)
         if page >= total_pages - 1:
             break
         page += 1
@@ -159,74 +145,57 @@ def get_items(scope: str, n: int, search: str = "") -> list:
     return items
 
 
-def get_pdf_url(item_uuid: str):
-    """Return (pdf_download_url, original_filename) or (None, None)."""
-    url = f"{REST_API}/core/items/{item_uuid}/bundles"
+def get_pdf_url(uuid):
     try:
-        resp    = requests.get(url, headers=HEADERS, timeout=20)
-        bundles = resp.json().get("_embedded", {}).get("bundles", [])
-    except Exception:
+        r       = requests.get(f"{REST_API}/core/items/{uuid}/bundles",
+                               headers=HEADERS, timeout=20)
+        bundles = r.json().get("_embedded",{}).get("bundles",[])
+    except:
         return None, None
-
     for bundle in bundles:
         if bundle.get("name") != "ORIGINAL":
             continue
-        bs_url = f"{REST_API}/core/bundles/{bundle['uuid']}/bitstreams"
         try:
-            bs_resp    = requests.get(bs_url, headers=HEADERS, timeout=20)
-            bitstreams = bs_resp.json().get("_embedded", {}).get("bitstreams", [])
-        except Exception:
+            r2 = requests.get(f"{REST_API}/core/bundles/{bundle['uuid']}/bitstreams",
+                              headers=HEADERS, timeout=20)
+            for bs in r2.json().get("_embedded",{}).get("bitstreams",[]):
+                fname = bs.get("name","")
+                if fname.lower().endswith(".pdf"):
+                    link = bs.get("_links",{}).get("content",{}).get("href","")
+                    if link:
+                        return link, fname
+        except:
             continue
-        for bs in bitstreams:
-            fname = bs.get("name", "")
-            if fname.lower().endswith(".pdf"):
-                link = bs.get("_links", {}).get("content", {}).get("href", "")
-                if link:
-                    return link, fname
     return None, None
 
 
-def download_pdf(url: str, dest: Path) -> bool:
+def download_pdf(url, dest):
     try:
-        resp = requests.get(url, headers=HEADERS, stream=True, timeout=180)
-        resp.raise_for_status()
+        r = requests.get(url, headers=HEADERS, stream=True, timeout=180)
+        r.raise_for_status()
         with open(dest, "wb") as f:
-            for chunk in resp.iter_content(8192):
+            for chunk in r.iter_content(8192):
                 f.write(chunk)
         return True
     except Exception as e:
-        print(f"    ❌ Download failed: {e}")
-        if dest.exists():
-            dest.unlink()
+        print(f"    ❌ {e}")
+        if dest.exists(): dest.unlink()
         return False
 
 
-def print_metadata(meta: dict):
-    """Pretty-print thesis metadata to terminal."""
-    fields = [
-        ("Author",        meta.get("author",       "—")),
-        ("Advisor",       meta.get("advisor",      "—")),
-        ("Second Reader", meta.get("second_reader","—")),
-        ("Date",          meta.get("date",         "—")),
-        ("Department",    meta.get("department",   "—")),
-        ("Degree",        meta.get("degree",       "—")),
-        ("Keywords",      meta.get("keywords",     "—")[:80]),
-    ]
-    for label, value in fields:
-        if value and value != "—":
-            print(f"    {label:<14}: {value}")
+def is_IS_department(meta):
+    """Filter: only keep Information Sciences department theses."""
+    dept = meta.get("department","").lower()
+    return "information science" in dept or dept == "" or "(is)" in dept
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Download IS theses from Calhoun NPS with metadata"
-    )
-    parser.add_argument("--n",      type=int, default=20,
-                        help="Number of theses to download (default: 20)")
-    parser.add_argument("--out",    default="./data",
-                        help="Output directory (default: ./data)")
-    parser.add_argument("--search", default="",
-                        help="Keyword filter (e.g. 'cyber AI network')")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n",      type=int, default=20)
+    parser.add_argument("--out",    default="./data")
+    parser.add_argument("--search", default="")
+    parser.add_argument("--all_depts", action="store_true",
+                        help="Download from all departments (no IS filter)")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -235,90 +204,94 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  Calhoun NPS Thesis Downloader")
-    print(f"  Target : {args.n} theses  |  Output: {out_dir.resolve()}")
-    if args.search:
-        print(f"  Filter : '{args.search}'")
+    print(f"  Target   : {args.n} IS theses")
+    print(f"  Output   : {out_dir.resolve()}")
+    if args.search: print(f"  Filter   : '{args.search}'")
     print(f"{'='*60}\n")
 
-    items      = get_items(IS_SCOPE, args.n, args.search)
+    # Fetch more than N to account for non-IS filtering
+    fetch_n   = args.n * 3 if not args.all_depts else args.n
+    stubs     = get_items_from_collection(IS_SCOPE, fetch_n, args.search)
     downloaded = skipped = failed = 0
-    all_meta   = []
+    all_meta  = []
 
-    for i, stub in enumerate(items, 1):
+    for i, stub in enumerate(stubs, 1):
+        if downloaded >= args.n:
+            break
+
         uuid = stub["uuid"]
-        print(f"[{i}/{len(items)}] Fetching metadata…")
+        print(f"[{i}/{len(stubs)}] Fetching metadata…")
 
-        # Get full item with metadata
-        full_item = get_full_item(uuid)
+        full = get_full_item(uuid)
         time.sleep(SLEEP)
 
-        meta  = extract_metadata(full_item) if full_item else {}
+        meta  = extract_metadata(full) if full else {}
         title = meta.get("title") or stub["name"] or "untitled"
         meta["uuid"] = uuid
 
-        print(f"  📄 {title[:70]}")
-        print_metadata(meta)
+        # Department filter
+        if not args.all_depts and not is_IS_department(meta):
+            dept = meta.get("department","unknown")
+            print(f"  ⏭️  Skipping — not IS dept ({dept})\n")
+            continue
 
-        # Determine output path
-        safe = sanitize_filename(title)
+        print(f"  📄 {title[:70]}")
+        for lbl, key in [("Author","author"),("Advisor","advisor"),
+                         ("Second Reader","second_reader"),("Date","date"),
+                         ("Department","department")]:
+            v = meta.get(key,"")
+            if v: print(f"    {lbl:<14}: {v[:80]}")
+
+        safe = sanitize(title)
         dest = out_dir / f"{safe}.pdf"
 
         if dest.exists() and dest.stat().st_size > 1000:
-            print(f"    ⏭️  Already exists — skipping download.\n")
+            print(f"    ⏭️  Already exists.\n")
             meta["pdf_file"] = dest.name
             meta["status"]   = "skipped"
             all_meta.append(meta)
             skipped += 1
+            downloaded += 1
             continue
 
-        # Find and download PDF
-        pdf_url, orig_fname = get_pdf_url(uuid)
+        pdf_url, orig = get_pdf_url(uuid)
         time.sleep(SLEEP)
 
         if not pdf_url:
-            print(f"    ⚠️  No PDF found.\n")
+            print(f"    ⚠️  No PDF.\n")
             meta["pdf_file"] = ""
             meta["status"]   = "no_pdf"
             all_meta.append(meta)
             failed += 1
             continue
 
-        print(f"    ⬇️  Downloading {orig_fname}…")
+        print(f"    ⬇️  {orig}…")
         ok = download_pdf(pdf_url, dest)
         time.sleep(SLEEP)
 
+        meta["pdf_file"] = dest.name if ok else ""
+        meta["status"]   = "downloaded" if ok else "failed"
+        all_meta.append(meta)
         if ok:
-            size_kb = dest.stat().st_size // 1024
-            print(f"    ✅ Saved ({size_kb} KB)\n")
-            meta["pdf_file"] = dest.name
-            meta["status"]   = "downloaded"
+            print(f"    ✅ {dest.stat().st_size//1024} KB\n")
             downloaded += 1
         else:
-            meta["pdf_file"] = ""
-            meta["status"]   = "failed"
             failed += 1
 
-        all_meta.append(meta)
-
-    # Write CSV
+    # Save CSV
     if all_meta:
-        fieldnames = ["title","author","advisor","second_reader","date",
-                      "department","degree","keywords","abstract",
-                      "pdf_file","status","uuid"]
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames,
-                                    extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(all_meta)
-        print(f"📋 Metadata saved → {csv_path}")
+        fields = ["title","author","advisor","second_reader","date",
+                  "department","degree","keywords","abstract","pdf_file","status","uuid"]
+        with open(csv_path,"w",newline="",encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(all_meta)
+        print(f"📋 Metadata → {csv_path}")
 
     print(f"\n{'='*60}")
-    print(f"  Downloaded : {downloaded}")
-    print(f"  Skipped    : {skipped}")
-    print(f"  Failed     : {failed}")
+    print(f"  Downloaded: {downloaded}  Skipped: {skipped}  Failed: {failed}")
     print(f"{'='*60}")
     print(f"\nNext: python build_vdb.py --reset")
-
 
 if __name__ == "__main__":
     main()
