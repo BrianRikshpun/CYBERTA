@@ -1,11 +1,10 @@
 """
 CyberTA – Calhoun NPS Thesis Downloader
-Downloads Information Sciences (IS) department theses.
-Paginates until no more results.
+Uses the correct browse/department endpoint to get all 743 IS theses.
 
 Usage:
     python download_calhoun.py --n 200
-    python download_calhoun.py --n 500 --search "cyber network"
+    python download_calhoun.py --n 743  # all of them
 """
 
 import os, re, sys, csv, time, argparse, requests
@@ -14,6 +13,10 @@ from pathlib import Path
 BASE     = "https://calhoun.nps.edu"
 REST_API = f"{BASE}/server/api"
 SLEEP    = 0.8
+
+# Correct endpoint for IS department — 743 theses
+IS_BROWSE_URL = (f"{REST_API}/discover/browses/department/items"
+                 f"?filterValue=Information%20Sciences%20(IS)")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; CyberTA/1.0; educational use)",
@@ -64,43 +67,27 @@ def get_full_item(uuid):
         return {}
 
 
-def get_all_items(n, dept="Information Sciences", search=""):
-    """
-    Paginate through ALL pages until empty or n reached.
-    """
+def get_all_items(n):
+    """Paginate through the IS department browse endpoint."""
     items = []
     seen  = set()
     page  = 0
     size  = 20
-    query = search if search else "*"
 
-    print(f"🔍 Fetching '{dept}' theses — paginating until {n} found or exhausted…")
+    print(f"🔍 Fetching IS (Information Sciences) theses — target: {n}…")
 
     while len(items) < n:
-        params = {
-            "query"        : query,
-            "dsoType"      : "item",
-            "f.department" : f"{dept},equals",
-            "page"         : page,
-            "size"         : size,
-            "sort"         : "dc.date.issued,DESC",
-        }
+        params = {"size": size, "page": page, "sort": "dc.date.issued,DESC"}
         try:
-            r = requests.get(f"{REST_API}/discover/search/objects",
-                             headers=HEADERS, params=params, timeout=30)
+            r = requests.get(IS_BROWSE_URL, headers=HEADERS,
+                             params=params, timeout=30)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
             print(f"  ⚠️  API error page {page}: {e}")
             break
 
-        objects = (data.get("_embedded",{})
-                       .get("searchResult",{})
-                       .get("_embedded",{})
-                       .get("objects",[]))
-        batch = [o.get("_embedded",{}).get("indexableObject",{})
-                 for o in objects]
-
+        batch = data.get("_embedded",{}).get("items",[])
         if not batch:
             print(f"  No more results at page {page}.")
             break
@@ -115,9 +102,12 @@ def get_all_items(n, dept="Information Sciences", search=""):
             if len(items) >= n:
                 break
 
-        print(f"  Page {page+1}: +{added} items (total: {len(items)})")
+        total = data.get("page",{}).get("totalElements","?")
+        pages = data.get("page",{}).get("totalPages","?")
+        print(f"  Page {page+1}/{pages} — +{added} items (total: {len(items)}/{total})")
 
-        if len(batch) < size:
+        total_pages = data.get("page",{}).get("totalPages", page+1)
+        if page >= total_pages - 1 or len(batch) < size:
             print(f"  Last page reached.")
             break
 
@@ -169,10 +159,10 @@ def download_pdf(url, dest):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n",      type=int, default=50)
-    parser.add_argument("--out",    default="./data")
-    parser.add_argument("--search", default="")
-    parser.add_argument("--dept",   default="Information Sciences")
+    parser.add_argument("--n",   type=int, default=50,
+                        help="Number of theses to download (default: 50, max: 743)")
+    parser.add_argument("--out", default="./data",
+                        help="Output directory (default: ./data)")
     args = parser.parse_args()
 
     out_dir  = Path(args.out)
@@ -181,13 +171,12 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  Calhoun NPS Thesis Downloader")
-    print(f"  Department : {args.dept}")
+    print(f"  Department : Information Sciences (IS) — 743 available")
     print(f"  Target     : {args.n} theses")
     print(f"  Output     : {out_dir.resolve()}")
-    if args.search: print(f"  Search     : '{args.search}'")
     print(f"{'='*60}\n")
 
-    stubs      = get_all_items(args.n, dept=args.dept, search=args.search)
+    stubs      = get_all_items(args.n)
     downloaded = skipped = failed = 0
     all_meta   = []
 
@@ -244,7 +233,7 @@ def main():
         else:
             failed += 1
 
-    # Save/append CSV
+    # Save CSV
     if all_meta:
         fields = ["title","author","advisor","second_reader","date",
                   "department","degree","keywords","abstract",
@@ -262,7 +251,7 @@ def main():
     print(f"  Skipped    : {skipped}")
     print(f"  Failed     : {failed}")
     print(f"{'='*60}")
-    print(f"\nNext: transfer data/ to Hamming, then python build_vdb.py --reset")
+    print(f"\nNext: scp data/ to Hamming, then python build_vdb.py --reset")
 
 if __name__ == "__main__":
     main()
